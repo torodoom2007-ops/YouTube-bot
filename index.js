@@ -1,168 +1,87 @@
-const TelegramBot = require('node-telegram-bot-api');
+const express = require('express');
+const { Telegraf } = require('telegraf');
 const { google } = require('googleapis');
-const { GoogleGenAI } = require('@google/genai');
-const fs = require('fs');
-const path = require('path');
-const cron = require('node-cron');
+const axios = require('axios');
+require('dotenv').config();
 
-// ==========================================
-// 1. טעינת משתני סביבה
-// ==========================================
-const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const YOUTUBE_CLIENT_ID = process.env.YOUTUBE_CLIENT_ID;
-const YOUTUBE_CLIENT_SECRET = process.env.YOUTUBE_CLIENT_SECRET;
-const YOUTUBE_REFRESH_TOKEN = process.env.YOUTUBE_REFRESH_TOKEN;
+// 1. שרת Express לשמירה על ה-Web Service פעיל ב-Render
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-// מפתחות AI מופרדים בפסיק: "KEY1,KEY2,KEY3"
-const AI_KEYS = (process.env.GEMINI_API_KEYS || '').split(',').map(k => k.trim()).filter(Boolean);
+app.get('/', (req, res) => {
+  res.send('🤖 Telegram to YouTube Bot is running!');
+});
 
-if (!TELEGRAM_TOKEN || !YOUTUBE_CLIENT_ID || !YOUTUBE_CLIENT_SECRET || !YOUTUBE_REFRESH_TOKEN || AI_KEYS.length === 0) {
-  console.error("❌ שגיאה: אחד או יותר ממשתני הסביבה חסרים!");
-  process.exit(1);
-}
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
 
-// ==========================================
-// 2. אתחול הבוט וה-APIs
-// ==========================================
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
-
-// מנגנון רוטציית מפתחות AI
-let currentKeyIndex = 0;
-
-function getAIClient() {
-  const apiKey = AI_KEYS[currentKeyIndex];
-  return new GoogleGenAI({ apiKey });
-}
-
-function rotateAIKey() {
-  currentKeyIndex = (currentKeyIndex + 1) % AI_KEYS.length;
-  console.log(`🔄 מפתח AI הוחלף למפתח אינדקס: ${currentKeyIndex}`);
-}
-
-async function generateMetadataWithAI(promptText) {
-  let attempts = 0;
-  while (attempts < AI_KEYS.length) {
-    try {
-      const ai = getAIClient();
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: `אתה מומחה לשיווק סרטים ביוטיוב. קבל את הנושא/הכותרת הבאה: "${promptText}".
-צור תגובה במבנה JSON מדויק בלבד ללא Markdown כדלקמן:
-{
-  "title": "כותרת מפתה ביוטיוב עם אימוג'ים (עד 90 תווים)",
-  "description": "תיאור ארוך, מושך ומפורט של הסרטון עם קריאה לפעולה",
-  "tags": ["תג1", "תג2", "תג3", "תג4", "תג5"]
-}`
-      });
-
-      const cleanJsonText = response.text.replace(/```json|```/g, '').trim();
-      return JSON.parse(cleanJsonText);
-    } catch (err) {
-      console.warn(`⚠️ שגיאה במפתח AI מס' ${currentKeyIndex}: ${err.message}. מנסה מפתח הבא...`);
-      rotateAIKey();
-      attempts++;
-    }
-  }
-  throw new Error("❌ כל מפתחות ה-AI נכשלו או הגיעו למגבלת הקרדיטים.");
-}
-
-// אתחול YouTube OAuth2
+// 2. הגדרת YouTube OAuth2 Client
 const oauth2Client = new google.auth.OAuth2(
-  YOUTUBE_CLIENT_ID,
-  YOUTUBE_CLIENT_SECRET,
+  process.env.YOUTUBE_CLIENT_ID,
+  process.env.YOUTUBE_CLIENT_SECRET,
   'https://developers.google.com/oauthplayground'
 );
 
-oauth2Client.setCredentials({ refresh_token: YOUTUBE_REFRESH_TOKEN });
+oauth2Client.setCredentials({
+  refresh_token: process.env.YOUTUBE_REFRESH_TOKEN,
+});
+
 const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
 
-// תור העלאות בזיכרון
-const uploadQueue = [];
+// 3. הגדרת הבוט בטלגרם
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
-// ==========================================
-// 3. טיפול בהודעות טלגרם
-// ==========================================
-console.log("🚀 Movie Auto-Publisher Bot is running...");
-
-bot.on('message', async (msg) => {
-  const chatId = msg.chat.id;
-
-  if (msg.text && msg.text.startsWith('/')) return;
-
-  // בדיקה אם הועבר וידאו
-  if (msg.video) {
-    const fileId = msg.video.file_id;
-    const caption = msg.caption || "סרטון חדש בעולם הסרטים";
-
-    bot.sendMessage(chatId, "📥 הסרטון התקבל! מוריד ומעבד נתונים בעזרת AI...");
-
-    try {
-      // 1. הורדת קובץ הוידאו מטלגרם
-      const filePath = await bot.downloadFile(fileId, './downloads');
-
-      // 2. יצירת Metadata בעזרת AI (כותרת, תיאור, תגיות)
-      const metadata = await generateMetadataWithAI(caption);
-
-      // 3. הכנסה לתור
-      uploadQueue.push({
-        filePath,
-        metadata,
-        chatId
-      });
-
-      bot.sendMessage(
-        chatId,
-        `✅ **הסרטון נוסף לתור ההעלאות!**\n\n` +
-        `🎬 **כותרת שנבחרה:** ${metadata.title}\n` +
-        `📉 **מיקום בתור:** ${uploadQueue.length}`
-      );
-    } catch (error) {
-      console.error("Error processing video:", error);
-      bot.sendMessage(chatId, `❌ שגיאה בעיבוד הסרטון: ${error.message}`);
-    }
-  } else {
-    bot.sendMessage(chatId, "🎥 אנא שלח קובץ וידאו (בצירוף כיתוב/נושא) כדי להעלות אותו ליוטיוב.");
-  }
+bot.start((ctx) => {
+  ctx.reply('שלום! שלח לי סרטון וידאו (עם תיאור/כותרת כטקסט נלווה) ואעלה אותו ישר לערוץ היוטיוב.');
 });
 
-// ==========================================
-// 4. מתזמן העלאה ליוטיוב (Cron Job)
-// ==========================================
-// מתוך מגבלות ה-API של יוטיוב (10,000 יחידות ביום), מומלץ להעלות אחת לכמה שעות (למשל כל 4 שעות).
-cron.schedule('0 */4 * * *', async () => {
-  if (uploadQueue.length === 0) return;
+bot.on('video', async (ctx) => {
+  const video = ctx.message.video;
+  const caption = ctx.message.caption || `וידאו מטלגרם - ${new Date().toLocaleDateString('he-IL')}`;
 
-  const item = uploadQueue.shift();
-  console.log(`🎬 מתחיל העלאה ליוטיוב: ${item.metadata.title}`);
+  ctx.reply('⏳ הוידאו התקבל! מוריד מטלגרם ומעלה ליוטיוב...');
 
   try {
-    const res = await youtube.videos.insert({
-      part: 'snippet,status',
-      requestBody: {
-        snippet: {
-          title: item.metadata.title,
-          description: `${item.metadata.description}\n\n${item.metadata.tags.map(t => `#${t}`).join(' ')}`,
-          tags: item.metadata.tags,
-          categoryId: '24' // 24 = Entertainment / Movies
-        },
-        status: {
-          privacyStatus: 'public', // ציבורי
-          selfDeclaredMadeForKids: false
-        }
-      },
-      media: {
-        body: fs.createReadStream(item.filePath)
-      }
+    // קבלת קישור להורדת הקובץ משרתי טלגרם
+    const fileLink = await ctx.telegram.getFileLink(video.file_id);
+
+    // הזרמת הקובץ ישירות מטלגרם (Stream)
+    const videoStream = await axios({
+      method: 'get',
+      url: fileLink.href,
+      responseType: 'stream',
     });
 
-    bot.sendMessage(item.chatId, `🎉 **הסרטון הועלה בהצלחה ליוטיוב!**\n🔗 https://www.youtube.com/watch?v=${res.data.id}`);
+    // העלאה ליוטיוב
+    const response = await youtube.videos.insert({
+      part: ['snippet', 'status'],
+      requestBody: {
+        snippet: {
+          title: caption,
+          description: 'הועלה אוטומטית באמצעות הבוט בטלגרם',
+        },
+        status: {
+          privacyStatus: process.env.YOUTUBE_PRIVACY_STATUS || 'unlisted', // 'public', 'private', או 'unlisted'
+        },
+      },
+      media: {
+        body: videoStream.data,
+      },
+    });
 
-    // ניקוי הקובץ המקומי
-    if (fs.existsSync(item.filePath)) {
-      fs.unlinkSync(item.filePath);
-    }
+    const videoId = response.data.id;
+    const youtubeUrl = `https://youtu.be/${videoId}`;
+
+    ctx.reply(`✅ הסרטון הועלה בהצלחה!\n🔗 ${youtubeUrl}`);
   } catch (error) {
-    console.error("YouTube Upload Error:", error);
-    bot.sendMessage(item.chatId, `❌ שגיאה בהעלאה ליוטיוב: ${error.message}`);
+    console.error('Upload Error:', error?.response?.data || error.message);
+    ctx.reply('❌ אירעה שגיאה בהעלאת הסרטון ליוטיוב. ודא שהקובץ אינו עולה על 20MB.');
   }
 });
+
+bot.launch();
+
+// יציאה מסודרת במקרה של ניתוק
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
