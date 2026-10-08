@@ -1,14 +1,17 @@
 {
-  "name": "whatsapp-telegram-bridge",
+  "name": "movie-ask-bot",
   "version": "1.0.0",
+  "description": "Telegram bot with express and gamification system",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node index.js"
   },
   "dependencies": {
     "express": "^4.19.2",
-    "qrcode": "^1.5.3",
-    "telegraf": "^4.16.3",
-    "whatsapp-web.js": "^1.23.0"
+    "node-telegram-bot-api": "^0.66.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
